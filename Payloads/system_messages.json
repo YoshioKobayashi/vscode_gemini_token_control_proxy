@@ -1,0 +1,22 @@
+[
+  {
+    "name": "expert_ai_programming_assistant_policy",
+    "source_file": "Payloads/requests_full/20260211_164458_d8407e01.json",
+    "sanitized": true
+  },
+  {
+    "name": "workspace_info",
+    "source_file": "Payloads/requests_full/20260211_164458_d8407e01.json",
+    "sanitized": true
+  },
+  {
+    "name": "context",
+    "source_file": "Payloads/requests_full/20260211_164458_d8407e01.json",
+    "sanitized": true
+  },
+  {
+    "name": "attachments",
+    "source_file": "Payloads/requests_full/20260211_164458_d8407e01.json",
+    "sanitized": true
+  }
+]

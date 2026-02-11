@@ -45,6 +45,7 @@ NO_TRUNCATE = False
 
 # Load tools selection config (defaults + overrides + settings)
 TOOL_SELECTION = None
+SYSTEM_MESSAGES = []
 
 
 def load_tools_selection():
@@ -86,6 +87,34 @@ try:
     load_tools_selection()
 except Exception:
     TOOL_SELECTION = {"defaults": {"enabled": True}, "overrides": {}, "settings": {"remove_system_instruction": True}}
+
+
+def load_system_messages():
+    """Lädt `Payloads/system_messages.json` falls vorhanden.
+    Ergebnis ist eine Liste von Einträgen mit Feldern: name, text, sanitized (bool), source_file (optional)
+    """
+    global SYSTEM_MESSAGES
+    path = os.path.join(os.path.dirname(__file__), "Payloads", "system_messages.json")
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            if isinstance(obj, list):
+                SYSTEM_MESSAGES = obj
+            else:
+                SYSTEM_MESSAGES = []
+        else:
+            SYSTEM_MESSAGES = []
+    except Exception as e:
+        ctx.log.warn(f"[!] Fehler beim Laden von system_messages.json: {e}")
+        SYSTEM_MESSAGES = []
+
+
+# initialize system messages on import
+try:
+    load_system_messages()
+except Exception:
+    SYSTEM_MESSAGES = []
 
 # Globale Stores
 response_cache = {}  # request_hash -> (response, timestamp)
@@ -466,6 +495,35 @@ def iter_parts_from_candidate(candidate):
                         cur = cur.get(tok, {})
 
 
+def enforce_single_candidate(data: dict) -> None:
+    """Ensure the request asks for only one candidate/result to save tokens.
+
+    Modifies `data` in-place. Tries common parameter names and nested sections.
+    """
+    if not isinstance(data, dict):
+        return
+
+    # Common parameter names used by different APIs
+    keys = ("candidate_count", "maxOutputCandidates", "best_of", "n", "num_return_sequences")
+    for key in keys:
+        if key in data:
+            data[key] = 1
+
+    # If there's a nested generation/options section, set there as well
+    gen_keys = ("generation", "options", "output_config")
+    for gk in gen_keys:
+        sub = data.get(gk)
+        if isinstance(sub, dict):
+            for key in ("candidate_count", "maxOutputCandidates", "best_of", "n"):
+                if key in sub:
+                    sub[key] = 1
+
+    # If a candidates array already exists in request, keep only the first (if present)
+    c = data.get("candidates")
+    if isinstance(c, list) and len(c) > 1:
+        data["candidates"] = [c[0]]
+
+
 
 def prune_backlog(data: dict, max_messages: int, preserve_system: bool = True) -> None:
     """Trimmt `data['contents']` so, dass höchstens `max_messages` non-system Nachrichten übrig bleiben.
@@ -500,26 +558,83 @@ def sanitize_request_for_backlog(data: dict, backlog_messages: int = BACKLOG_MES
     if not isinstance(data, dict):
         return
 
-    # Entferne sehr große, unnötige Top-Level Keys. Entferne `systemInstruction`
-    # standardmäßig nur, wenn die Auswahl dies verlangt (Settings).
-    remove_system = True
+    # Entferne sehr große, unnötige Top-Level Keys.
+    # Behandlung von `systemInstruction` ist selektierbar: Standard ist via TOOL_SELECTION.settings steuerbar.
+    remove_system_default = True
     try:
         if TOOL_SELECTION and isinstance(TOOL_SELECTION, dict):
-            remove_system = bool(TOOL_SELECTION.get("settings", {}).get("remove_system_instruction", True))
+            remove_system_default = bool(TOOL_SELECTION.get("settings", {}).get("remove_system_instruction", True))
     except Exception:
-        remove_system = True
+        remove_system_default = True
 
     top_level_remove = ["tools", "toolUseInstructions", "editFileInstructions",
                         "notebookInstructions", "reminderInstructions"]
-    if remove_system:
-        top_level_remove.insert(0, "systemInstruction")
 
+    # systemInstruction behandeln wir gesondert: ggf. selektiv per SYSTEM_MESSAGES
+    # Zuerst entferne die generellen Top-Level Keys
     for k in top_level_remove:
         if k in data:
             try:
                 del data[k]
             except Exception:
                 pass
+
+    # Selektive Entfernung von systemInstruction: wenn SYSTEM_MESSAGES definiert sind,
+    # versuchen wir, das systemInstruction-Text mit einem Eintrag zu matchen und dessen
+    # `sanitized`-Flag anzuwenden. Falls kein Match und default erlaubt, entfernen wir es.
+    try:
+        if "systemInstruction" in data:
+            si = data.get("systemInstruction")
+
+            def extract_text_from_si(si_obj):
+                if isinstance(si_obj, str):
+                    return si_obj
+                if isinstance(si_obj, dict):
+                    # Wenn parts vorhanden sind, konkatenieren
+                    parts = si_obj.get("parts")
+                    if isinstance(parts, list):
+                        texts = []
+                        for p in parts:
+                            if isinstance(p, dict) and isinstance(p.get("text"), str):
+                                texts.append(p.get("text"))
+                        return "\n".join(texts)
+                    # fallback: serialize
+                    try:
+                        return json.dumps(si_obj, ensure_ascii=False)
+                    except Exception:
+                        return str(si_obj)
+                return str(si_obj)
+
+            si_text = extract_text_from_si(si)
+            matched = False
+            if SYSTEM_MESSAGES:
+                for entry in SYSTEM_MESSAGES:
+                    entry_text = entry.get("text") or ""
+                    sanitized_flag = bool(entry.get("sanitized", True))
+                    # match heuristics: exact substring match or entry contained in si_text
+                    if not entry_text:
+                        continue
+                    try:
+                        if entry_text.strip() and (entry_text.strip() in si_text or si_text in entry_text.strip()):
+                            matched = True
+                            if sanitized_flag:
+                                try:
+                                    del data["systemInstruction"]
+                                except Exception:
+                                    pass
+                            # if not sanitized_flag -> keep as-is
+                            break
+                    except Exception:
+                        continue
+
+            # kein Match gefunden -> wende default an
+            if not matched and remove_system_default:
+                try:
+                    del data["systemInstruction"]
+                except Exception:
+                    pass
+    except Exception as e:
+        ctx.log.warn(f"[!] Fehler beim selektiven Entfernen von systemInstruction: {e}")
 
     # Entferne deaktivierte Tools (laut TOOL_SELECTION)
     try:
@@ -552,7 +667,7 @@ def sanitize_request_for_backlog(data: dict, backlog_messages: int = BACKLOG_MES
     except Exception as e:
         ctx.log.warn(f"[!] Fehler beim Anwenden der Tools-Selection: {e}")
 
-    # Entferne eingebettete environment/workspace infos innerhalb parts
+    # Entferne eingebettete environment/workspace/context/attachments infos innerhalb parts
     tool = RequestJSONTool()
     try:
         tool.strip_marked_sections(data, "<environment_info>", "</environment_info>")
@@ -562,9 +677,22 @@ def sanitize_request_for_backlog(data: dict, backlog_messages: int = BACKLOG_MES
         tool.strip_marked_sections(data, "<workspace_info>", "</workspace_info>")
     except Exception:
         pass
+    try:
+        tool.strip_marked_sections(data, "<context>", "</context>")
+    except Exception:
+        pass
+    try:
+        tool.strip_marked_sections(data, "<attachments>", "</attachments>")
+    except Exception:
+        pass
 
     # Prune contents backlog
     prune_backlog(data, backlog_messages, preserve_system=BACKLOG_PRESERVE_SYSTEM)
+    # Enforce single candidate/request options to avoid token waste
+    try:
+        enforce_single_candidate(data)
+    except Exception as e:
+        ctx.log.warn(f"[!] Fehler beim Erzwingen single-candidate: {e}")
 
 # ---------- Signaturen injizieren (vor Request) ----------
 
